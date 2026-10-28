@@ -104,6 +104,22 @@ async function ensureSchema() {
   await pool.query('CREATE INDEX IF NOT EXISTS orders_user_idx ON orders (user_id, id DESC);');
   await pool.query('CREATE INDEX IF NOT EXISTS wallet_ledger_user_idx ON wallet_ledger (user_id, id DESC);');
   await pool.query('CREATE INDEX IF NOT EXISTS topup_requests_status_idx ON topup_requests (status, id DESC);');
+  // Phase 4: coupons + order coupon fields (idempotent; existing DBs gain them on boot).
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS coupons (
+      id SERIAL PRIMARY KEY,
+      code TEXT NOT NULL UNIQUE,
+      kind TEXT NOT NULL CHECK (kind IN ('percent', 'flat')),
+      value INTEGER NOT NULL CHECK (value > 0),
+      max_uses INTEGER,
+      used_count INTEGER NOT NULL DEFAULT 0,
+      expires_at TIMESTAMPTZ,
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );`
+  );
+  await pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS coupon_code TEXT NOT NULL DEFAULT \'\';');
+  await pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount INTEGER NOT NULL DEFAULT 0;');
 }
 
 // Tiny in-memory rate limiter for the auth routes (per IP, rolling window).
@@ -278,6 +294,8 @@ function orderOut(row) {
     player_id: row.player_id,
     zone_id: row.zone_id,
     payment_method: row.payment_method,
+    coupon_code: row.coupon_code || '',
+    discount: row.discount || 0,
     status: row.status,
     created_at: row.created_at,
     updated_at: row.updated_at,
@@ -324,27 +342,50 @@ app.post('/api/orders', requireAuth, rateLimit, async (req, res) => {
   const zoneId = cleanStr(req.body.zone_id, 100);
   const price = Number(req.body.price);
   const method = req.body.payment_method;
+  const couponCode = cleanStr(req.body.coupon_code, 50).toUpperCase();
   if (!game || !pack || !playerId || !Number.isInteger(price) || price < 0 || (method !== 'wallet' && method !== 'whatsapp')) {
     return res.status(400).json({ error: 'Invalid order details.' });
   }
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    // Phase 4: optional coupon — validated and consumed inside the same
+    // transaction as the order, so a code can never be double-spent.
+    let finalPrice = price;
+    let discountAmt = 0;
+    let couponRow = null;
+    if (couponCode) {
+      const c = await client.query('SELECT * FROM coupons WHERE code = $1 FOR UPDATE', [couponCode]);
+      if (c.rows.length === 0 || !c.rows[0].active ||
+          (c.rows[0].expires_at && new Date(c.rows[0].expires_at) <= new Date()) ||
+          (c.rows[0].max_uses !== null && c.rows[0].used_count >= c.rows[0].max_uses)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Invalid or expired coupon.' });
+      }
+      couponRow = c.rows[0];
+      discountAmt = couponRow.kind === 'percent'
+        ? Math.floor(price * couponRow.value / 100)
+        : Math.min(couponRow.value, price);
+      finalPrice = price - discountAmt;
+    }
     const ins = await client.query(
-      `INSERT INTO orders (user_id, game, pack, price, player_id, zone_id, payment_method, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-      [req.user.id, game, pack, price, playerId, zoneId, method, method === 'wallet' ? 'paid' : 'pending']
+      `INSERT INTO orders (user_id, game, pack, price, player_id, zone_id, payment_method, status, coupon_code, discount)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+      [req.user.id, game, pack, finalPrice, playerId, zoneId, method, method === 'wallet' ? 'paid' : 'pending', couponCode, discountAmt]
     );
     const order = ins.rows[0];
+    if (couponRow) {
+      await client.query('UPDATE coupons SET used_count = used_count + 1 WHERE id = $1', [couponRow.id]);
+    }
     if (method === 'wallet') {
       await client.query('INSERT INTO wallets (user_id, balance) VALUES ($1, 0) ON CONFLICT (user_id) DO NOTHING', [req.user.id]);
       const w = await client.query('SELECT balance FROM wallets WHERE user_id = $1 FOR UPDATE', [req.user.id]);
-      if (w.rows[0].balance < price) {
+      if (w.rows[0].balance < finalPrice) {
         await client.query('ROLLBACK');
         return res.status(400).json({ error: 'Not enough coins in the wallet.' });
       }
-      await client.query('UPDATE wallets SET balance = balance - $1, updated_at = NOW() WHERE user_id = $2', [price, req.user.id]);
-      await client.query('INSERT INTO wallet_ledger (user_id, delta, kind, ref) VALUES ($1, $2, $3, $4)', [req.user.id, -price, 'order_payment', `CP2-${order.id}`]);
+      await client.query('UPDATE wallets SET balance = balance - $1, updated_at = NOW() WHERE user_id = $2', [finalPrice, req.user.id]);
+      await client.query('INSERT INTO wallet_ledger (user_id, delta, kind, ref) VALUES ($1, $2, $3, $4)', [req.user.id, -finalPrice, 'order_payment', `CP2-${order.id}`]);
     }
     await client.query('COMMIT');
     res.status(201).json(orderOut(order));
@@ -498,6 +539,114 @@ app.post('/api/admin/topup-requests/:id/decision', requireAuth, rateLimit, async
     res.status(500).json({ error: 'Could not decide the request.' });
   } finally {
     client.release();
+  }
+});
+
+// ---- Phase 4: best sellers (real delivered counts) + coupons ----
+// Best sellers is aggregate-only (game + delivered count), no buyer data.
+app.get('/api/stats/best-sellers', async (req, res) => {
+  if (!pool) return res.json({ games: [] });
+  try {
+    const { rows } = await pool.query(
+      `SELECT game, COUNT(*)::int AS delivered FROM orders
+       WHERE status = 'delivered' GROUP BY game ORDER BY delivered DESC LIMIT 10`
+    );
+    res.json({ games: rows });
+  } catch (err) {
+    console.error('best sellers failed:', err);
+    res.status(500).json({ error: 'Could not load best sellers.' });
+  }
+});
+
+function couponUsable(row) {
+  if (!row || !row.active) return false;
+  if (row.expires_at && new Date(row.expires_at) <= new Date()) return false;
+  if (row.max_uses !== null && row.used_count >= row.max_uses) return false;
+  return true;
+}
+
+function couponDiscount(row, price) {
+  return row.kind === 'percent'
+    ? Math.floor(price * row.value / 100)
+    : Math.min(row.value, price);
+}
+
+app.post('/api/coupons/validate', requireAuth, rateLimit, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Auth service is not connected to a database yet.' });
+  const code = cleanStr(req.body.code, 50).toUpperCase();
+  const price = Number(req.body.price);
+  if (!code || !Number.isInteger(price) || price < 0) {
+    return res.status(400).json({ error: 'Invalid coupon check.' });
+  }
+  try {
+    const { rows } = await pool.query('SELECT * FROM coupons WHERE code = $1', [code]);
+    if (!couponUsable(rows[0])) return res.json({ valid: false, error: 'Invalid or expired coupon.' });
+    const discount = couponDiscount(rows[0], price);
+    res.json({ valid: true, code, discount, final_price: price - discount });
+  } catch (err) {
+    console.error('coupon validate failed:', err);
+    res.status(500).json({ error: 'Could not check the coupon.' });
+  }
+});
+
+app.get('/api/admin/coupons', requireAuth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Auth service is not connected to a database yet.' });
+  if (!isAdmin(req)) return res.status(403).json({ error: 'Admin access only.' });
+  try {
+    const { rows } = await pool.query('SELECT * FROM coupons ORDER BY id DESC LIMIT 200');
+    res.json({ coupons: rows });
+  } catch (err) {
+    console.error('admin coupons read failed:', err);
+    res.status(500).json({ error: 'Could not load coupons.' });
+  }
+});
+
+app.post('/api/admin/coupons', requireAuth, rateLimit, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Auth service is not connected to a database yet.' });
+  if (!isAdmin(req)) return res.status(403).json({ error: 'Admin access only.' });
+  const code = cleanStr(req.body.code, 50).toUpperCase();
+  const kind = req.body.kind;
+  const value = Number(req.body.value);
+  const maxUses = req.body.max_uses === null || req.body.max_uses === undefined || req.body.max_uses === ''
+    ? null
+    : Number(req.body.max_uses);
+  const expiresAt = req.body.expires_at ? new Date(req.body.expires_at) : null;
+  if (!code || (kind !== 'percent' && kind !== 'flat') || !Number.isInteger(value) || value <= 0 ||
+      (kind === 'percent' && value > 100) ||
+      (maxUses !== null && (!Number.isInteger(maxUses) || maxUses <= 0)) ||
+      (req.body.expires_at && Number.isNaN(expiresAt.getTime()))) {
+    return res.status(400).json({ error: 'Invalid coupon details.' });
+  }
+  try {
+    const { rows } = await pool.query(
+      'INSERT INTO coupons (code, kind, value, max_uses, expires_at) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+      [code, kind, value, maxUses, expiresAt ? expiresAt.toISOString() : null]
+    );
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    if (err && err.code === '23505') {
+      return res.status(409).json({ error: 'That coupon code already exists.' });
+    }
+    console.error('coupon create failed:', err);
+    res.status(500).json({ error: 'Could not create the coupon.' });
+  }
+});
+
+app.post('/api/admin/coupons/:id/toggle', requireAuth, rateLimit, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Auth service is not connected to a database yet.' });
+  if (!isAdmin(req)) return res.status(403).json({ error: 'Admin access only.' });
+  const id = Number(req.params.id);
+  const active = req.body.active;
+  if (!Number.isInteger(id) || typeof active !== 'boolean') {
+    return res.status(400).json({ error: 'Invalid toggle.' });
+  }
+  try {
+    const { rows } = await pool.query('UPDATE coupons SET active = $1 WHERE id = $2 RETURNING *', [active, id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Coupon not found.' });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('coupon toggle failed:', err);
+    res.status(500).json({ error: 'Could not update the coupon.' });
   }
 });
 
