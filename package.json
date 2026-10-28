@@ -1,0 +1,1 @@
+{"dependencies":{"bcryptjs":"^2.4.3","express":"^4.21.2","jsonwebtoken":"^9.0.2","pg":"^8.13.1"},"description":"Email + password auth service for the Avardo Copy 2 store","engines":{"node":">=18"},"main":"server.js","name":"avardo-copy2-auth","private":true,"scripts":{"start":"node server.js"},"version":"1.0.0"}
