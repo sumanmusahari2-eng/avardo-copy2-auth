@@ -14,7 +14,7 @@ const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
 
 const app = express();
-app.use(express.json({ limit: '32kb' }));
+app.use(express.json({ limit: '512kb' }));
 
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || '';
@@ -49,6 +49,13 @@ async function ensureSchema() {
       password_hash TEXT NOT NULL,
       name TEXT NOT NULL DEFAULT '',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );`
+  );
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS store_data (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      data JSONB NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );`
   );
 }
@@ -159,6 +166,46 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
   } catch (err) {
     console.error('me failed:', err);
     res.status(500).json({ error: 'Could not load the account.' });
+  }
+});
+
+// ---- Store data (admin together with the store login) ----
+// The storefront loads its live catalogue/settings from here when present
+// and falls back to its built-in data otherwise. Only the store admin
+// (Sumanmusahari@gmail.com, signed in) may save.
+const ADMIN_EMAIL = 'sumanmusahari@gmail.com';
+
+app.get('/api/store', async (req, res) => {
+  if (!pool) return res.json({ configured: false });
+  try {
+    const { rows } = await pool.query('SELECT data FROM store_data WHERE id = 1');
+    if (rows.length === 0) return res.json({ configured: false });
+    res.json({ configured: true, ...rows[0].data });
+  } catch (err) {
+    console.error('store read failed:', err);
+    res.status(500).json({ error: 'Could not load store data.' });
+  }
+});
+
+app.put('/api/admin/store', requireAuth, rateLimit, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Auth service is not connected to a database yet.' });
+  if (!req.user || req.user.email !== ADMIN_EMAIL) {
+    return res.status(403).json({ error: 'Admin access only.' });
+  }
+  const data = req.body;
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    return res.status(400).json({ error: 'Invalid store data.' });
+  }
+  try {
+    await pool.query(
+      `INSERT INTO store_data (id, data, updated_at) VALUES (1, $1::jsonb, NOW())
+       ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
+      [JSON.stringify(data)]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('store save failed:', err);
+    res.status(500).json({ error: 'Could not save store data.' });
   }
 });
 
