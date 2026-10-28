@@ -831,6 +831,25 @@ app.post('/api/admin/resellers', requireAuth, rateLimit, async (req, res) => {
   }
 });
 
+// ---- Users panel: admin lists every registered account ----
+// Explicit columns only — password hashes are never returned. Order counts
+// come from a single grouped join so the panel needs no second round-trip.
+app.get('/api/admin/users', requireAuth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Auth service is not connected to a database yet.' });
+  if (!isAdmin(req)) return res.status(403).json({ error: 'Admin access only.' });
+  try {
+    const { rows } = await pool.query(
+      `SELECT u.id, u.email, u.name, u.created_at, u.is_reseller, COUNT(o.id)::int AS order_count
+       FROM users u LEFT JOIN orders o ON o.user_id = u.id
+       GROUP BY u.id ORDER BY u.created_at DESC`
+    );
+    res.json({ users: rows });
+  } catch (err) {
+    console.error('users list failed:', err);
+    res.status(500).json({ error: 'Could not load users.' });
+  }
+});
+
 app.post('/api/games/check-id', rateLimit, async (req, res) => {
   const game = cleanStr(req.body.game, 200);
   const pack = cleanStr(req.body.pack, 200);
