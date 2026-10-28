@@ -30,7 +30,7 @@ app.use((req, res, next) => {
   res.setHeader('Vary', 'Origin');
   if (req.method === 'OPTIONS') {
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     return res.status(204).end();
   }
   next();
@@ -58,6 +58,52 @@ async function ensureSchema() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );`
   );
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS wallets (
+      user_id INTEGER PRIMARY KEY REFERENCES users(id),
+      balance INTEGER NOT NULL DEFAULT 0 CHECK (balance >= 0),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );`
+  );
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS wallet_ledger (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      delta INTEGER NOT NULL,
+      kind TEXT NOT NULL,
+      ref TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );`
+  );
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS orders (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      game TEXT NOT NULL,
+      pack TEXT NOT NULL,
+      price INTEGER NOT NULL CHECK (price >= 0),
+      player_id TEXT NOT NULL DEFAULT '',
+      zone_id TEXT NOT NULL DEFAULT '',
+      payment_method TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );`
+  );
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS topup_requests (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      amount INTEGER NOT NULL CHECK (amount > 0),
+      note TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );`
+  );
+  await pool.query('CREATE INDEX IF NOT EXISTS orders_user_idx ON orders (user_id, id DESC);');
+  await pool.query('CREATE INDEX IF NOT EXISTS wallet_ledger_user_idx ON wallet_ledger (user_id, id DESC);');
+  await pool.query('CREATE INDEX IF NOT EXISTS topup_requests_status_idx ON topup_requests (status, id DESC);');
 }
 
 // Tiny in-memory rate limiter for the auth routes (per IP, rolling window).
@@ -206,6 +252,252 @@ app.put('/api/admin/store', requireAuth, rateLimit, async (req, res) => {
   } catch (err) {
     console.error('store save failed:', err);
     res.status(500).json({ error: 'Could not save store data.' });
+  }
+});
+
+// ---- Phase 1: orders, wallet, top-up requests ----
+// Coins: 1 coin = ₹1. Wallet payments deduct immediately and the order
+// becomes paid (awaiting delivery); WhatsApp orders stay pending until the
+// admin confirms payment. Only the admin (ADMIN_EMAIL) may change order
+// status or approve top-ups; cancelling a paid wallet order refunds it.
+function isAdmin(req) {
+  return !!(req.user && req.user.email === ADMIN_EMAIL);
+}
+
+function cleanStr(v, max) {
+  return typeof v === 'string' ? v.trim().slice(0, max) : '';
+}
+
+function orderOut(row) {
+  return {
+    id: row.id,
+    code: `CP2-${row.id}`,
+    game: row.game,
+    pack: row.pack,
+    price: row.price,
+    player_id: row.player_id,
+    zone_id: row.zone_id,
+    payment_method: row.payment_method,
+    status: row.status,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+app.get('/api/wallet/me', requireAuth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Auth service is not connected to a database yet.' });
+  try {
+    await pool.query('INSERT INTO wallets (user_id, balance) VALUES ($1, 0) ON CONFLICT (user_id) DO NOTHING', [req.user.id]);
+    const bal = await pool.query('SELECT balance FROM wallets WHERE user_id = $1', [req.user.id]);
+    const led = await pool.query('SELECT id, delta, kind, ref, created_at FROM wallet_ledger WHERE user_id = $1 ORDER BY id DESC LIMIT 50', [req.user.id]);
+    res.json({ balance: bal.rows[0] ? bal.rows[0].balance : 0, ledger: led.rows });
+  } catch (err) {
+    console.error('wallet read failed:', err);
+    res.status(500).json({ error: 'Could not load the wallet.' });
+  }
+});
+
+app.post('/api/wallet/topup-request', requireAuth, rateLimit, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Auth service is not connected to a database yet.' });
+  const amount = Number(req.body.amount);
+  const note = cleanStr(req.body.note, 200);
+  if (!Number.isInteger(amount) || amount <= 0 || amount > 100000) {
+    return res.status(400).json({ error: 'Enter a top-up amount between 1 and 100000 coins.' });
+  }
+  try {
+    const { rows } = await pool.query(
+      'INSERT INTO topup_requests (user_id, amount, note) VALUES ($1, $2, $3) RETURNING id, amount, note, status, created_at',
+      [req.user.id, amount, note]
+    );
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    console.error('topup request failed:', err);
+    res.status(500).json({ error: 'Could not create the top-up request.' });
+  }
+});
+
+app.post('/api/orders', requireAuth, rateLimit, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Auth service is not connected to a database yet.' });
+  const game = cleanStr(req.body.game, 200);
+  const pack = cleanStr(req.body.pack, 200);
+  const playerId = cleanStr(req.body.player_id, 100);
+  const zoneId = cleanStr(req.body.zone_id, 100);
+  const price = Number(req.body.price);
+  const method = req.body.payment_method;
+  if (!game || !pack || !playerId || !Number.isInteger(price) || price < 0 || (method !== 'wallet' && method !== 'whatsapp')) {
+    return res.status(400).json({ error: 'Invalid order details.' });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const ins = await client.query(
+      `INSERT INTO orders (user_id, game, pack, price, player_id, zone_id, payment_method, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [req.user.id, game, pack, price, playerId, zoneId, method, method === 'wallet' ? 'paid' : 'pending']
+    );
+    const order = ins.rows[0];
+    if (method === 'wallet') {
+      await client.query('INSERT INTO wallets (user_id, balance) VALUES ($1, 0) ON CONFLICT (user_id) DO NOTHING', [req.user.id]);
+      const w = await client.query('SELECT balance FROM wallets WHERE user_id = $1 FOR UPDATE', [req.user.id]);
+      if (w.rows[0].balance < price) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Not enough coins in the wallet.' });
+      }
+      await client.query('UPDATE wallets SET balance = balance - $1, updated_at = NOW() WHERE user_id = $2', [price, req.user.id]);
+      await client.query('INSERT INTO wallet_ledger (user_id, delta, kind, ref) VALUES ($1, $2, $3, $4)', [req.user.id, -price, 'order_payment', `CP2-${order.id}`]);
+    }
+    await client.query('COMMIT');
+    res.status(201).json(orderOut(order));
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('order create failed:', err);
+    res.status(500).json({ error: 'Could not place the order.' });
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/api/orders/me', requireAuth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Auth service is not connected to a database yet.' });
+  try {
+    const { rows } = await pool.query('SELECT * FROM orders WHERE user_id = $1 ORDER BY id DESC LIMIT 100', [req.user.id]);
+    res.json({ orders: rows.map(orderOut) });
+  } catch (err) {
+    console.error('orders read failed:', err);
+    res.status(500).json({ error: 'Could not load orders.' });
+  }
+});
+
+app.get('/api/orders/:id', requireAuth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Auth service is not connected to a database yet.' });
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(404).json({ error: 'Order not found.' });
+  try {
+    const { rows } = await pool.query('SELECT * FROM orders WHERE id = $1', [id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Order not found.' });
+    if (rows[0].user_id !== req.user.id && !isAdmin(req)) return res.status(404).json({ error: 'Order not found.' });
+    res.json(orderOut(rows[0]));
+  } catch (err) {
+    console.error('order read failed:', err);
+    res.status(500).json({ error: 'Could not load the order.' });
+  }
+});
+
+app.get('/api/admin/orders', requireAuth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Auth service is not connected to a database yet.' });
+  if (!isAdmin(req)) return res.status(403).json({ error: 'Admin access only.' });
+  const status = typeof req.query.status === 'string' ? req.query.status : '';
+  try {
+    const args = [];
+    let where = '';
+    if (['pending', 'paid', 'delivered', 'cancelled'].includes(status)) {
+      where = 'WHERE o.status = $1';
+      args.push(status);
+    }
+    const { rows } = await pool.query(
+      `SELECT o.*, u.email AS user_email FROM orders o JOIN users u ON u.id = o.user_id ${where} ORDER BY o.id DESC LIMIT 200`,
+      args
+    );
+    res.json({ orders: rows.map((r) => ({ ...orderOut(r), user_email: r.user_email })) });
+  } catch (err) {
+    console.error('admin orders read failed:', err);
+    res.status(500).json({ error: 'Could not load orders.' });
+  }
+});
+
+app.post('/api/admin/orders/:id/status', requireAuth, rateLimit, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Auth service is not connected to a database yet.' });
+  if (!isAdmin(req)) return res.status(403).json({ error: 'Admin access only.' });
+  const id = Number(req.params.id);
+  const next = req.body.status;
+  const allowed = { pending: ['paid', 'delivered', 'cancelled'], paid: ['delivered', 'cancelled'] };
+  if (!Number.isInteger(id) || typeof next !== 'string') return res.status(400).json({ error: 'Invalid status change.' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const cur = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [id]);
+    if (cur.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Order not found.' });
+    }
+    const order = cur.rows[0];
+    if (!allowed[order.status] || !allowed[order.status].includes(next)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: `Cannot move an order from ${order.status} to ${next}.` });
+    }
+    await client.query('UPDATE orders SET status = $1, updated_at = NOW() WHERE id = $2', [next, id]);
+    if (next === 'cancelled' && order.status === 'paid' && order.payment_method === 'wallet') {
+      await client.query(
+        `INSERT INTO wallets (user_id, balance) VALUES ($1, $2)
+         ON CONFLICT (user_id) DO UPDATE SET balance = wallets.balance + EXCLUDED.balance, updated_at = NOW()`,
+        [order.user_id, order.price]
+      );
+      await client.query('INSERT INTO wallet_ledger (user_id, delta, kind, ref) VALUES ($1, $2, $3, $4)', [order.user_id, order.price, 'order_refund', `CP2-${order.id}`]);
+    }
+    await client.query('COMMIT');
+    res.json({ ok: true, status: next });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('order status failed:', err);
+    res.status(500).json({ error: 'Could not update the order.' });
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/api/admin/topup-requests', requireAuth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Auth service is not connected to a database yet.' });
+  if (!isAdmin(req)) return res.status(403).json({ error: 'Admin access only.' });
+  try {
+    const { rows } = await pool.query(
+      `SELECT t.*, u.email AS user_email FROM topup_requests t JOIN users u ON u.id = t.user_id
+       ORDER BY (t.status = 'pending') DESC, t.id DESC LIMIT 200`
+    );
+    res.json({ requests: rows });
+  } catch (err) {
+    console.error('admin topups read failed:', err);
+    res.status(500).json({ error: 'Could not load top-up requests.' });
+  }
+});
+
+app.post('/api/admin/topup-requests/:id/decision', requireAuth, rateLimit, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Auth service is not connected to a database yet.' });
+  if (!isAdmin(req)) return res.status(403).json({ error: 'Admin access only.' });
+  const id = Number(req.params.id);
+  const decision = req.body.decision;
+  if (!Number.isInteger(id) || (decision !== 'approved' && decision !== 'rejected')) {
+    return res.status(400).json({ error: 'Invalid decision.' });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const cur = await client.query('SELECT * FROM topup_requests WHERE id = $1 FOR UPDATE', [id]);
+    if (cur.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Request not found.' });
+    }
+    const reqRow = cur.rows[0];
+    if (reqRow.status !== 'pending') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'This request was already decided.' });
+    }
+    await client.query('UPDATE topup_requests SET status = $1, updated_at = NOW() WHERE id = $2', [decision, id]);
+    if (decision === 'approved') {
+      await client.query(
+        `INSERT INTO wallets (user_id, balance) VALUES ($1, $2)
+         ON CONFLICT (user_id) DO UPDATE SET balance = wallets.balance + EXCLUDED.balance, updated_at = NOW()`,
+        [reqRow.user_id, reqRow.amount]
+      );
+      await client.query('INSERT INTO wallet_ledger (user_id, delta, kind, ref) VALUES ($1, $2, $3, $4)', [reqRow.user_id, reqRow.amount, 'topup', `topup-${reqRow.id}`]);
+    }
+    await client.query('COMMIT');
+    res.json({ ok: true, status: decision });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('topup decision failed:', err);
+    res.status(500).json({ error: 'Could not decide the request.' });
+  } finally {
+    client.release();
   }
 });
 
