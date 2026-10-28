@@ -47,3 +47,13 @@ email, profile; set the OAuth consent screen to Production so anyone can
 sign in; set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` here.
 `GOOGLE_REDIRECT_URI` is optional — it defaults to this service's own
 callback URL.
+
+## Store data (admin inside the store)
+
+- `GET /api/store` — public live catalogue/settings. Returns
+  `{ configured: false }` until an admin has saved, and the saved data after
+  that. The storefront falls back to its built-in data when nothing is saved.
+- `PUT /api/admin/store` — `Authorization: Bearer <token>`, admin only
+  (the signed-in email must be Sumanmusahari@gmail.com). Body is the store
+  data JSON (games, WhatsApp number, theme, support note, ...), saved as one
+  row and served to all visitors by `GET /api/store`.
