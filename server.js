@@ -681,7 +681,10 @@ async function findBusanMapping(game, pack) {
     const games = rows[0].data && Array.isArray(rows[0].data.games) ? rows[0].data.games : [];
     const g = games.find((x) => String((x && x.name) || '').trim().toLowerCase() === String(game || '').trim().toLowerCase());
     if (!g || !Array.isArray(g.packs)) return '';
-    const p = g.packs.find((x) => String((x && x.name) || '').trim().toLowerCase() === String(pack || '').trim().toLowerCase());
+    // Pack display names live in `amt` ("3 Diamonds"), not `name` — match
+    // amt first, with name/label/title as fallbacks so older saves still work.
+    const packName = (x) => String((x && (x.amt || x.name || x.label || x.title)) || '').trim().toLowerCase();
+    const p = g.packs.find((x) => packName(x) === String(pack || '').trim().toLowerCase());
     if (!p) return '';
     return String(p.busanProductId || '').trim();
   } catch (err) {
