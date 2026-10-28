@@ -33,3 +33,17 @@ Tokens are JWTs (30 days). Passwords are bcrypt hashes — never stored plain.
 Note: Render's free web service sleeps after inactivity, so the first
 sign-in after idle takes a few seconds to wake up. Accounts and data live
 in the Postgres database, not on the web service, so sleeping loses nothing.
+
+## Google sign-in
+
+- `GET /api/auth/google` — starts Google sign-in (redirects to Google).
+- `GET /api/auth/google/callback` — Google redirects back here; the account
+  is found or created by email, then the browser returns to the store with
+  `#token=<jwt>` in the URL hash for the storefront to pick up.
+
+Setup: in Google Cloud Console, create an OAuth client (Web application)
+with redirect URI `<service-url>/api/auth/google/callback`, scopes openid,
+email, profile; set the OAuth consent screen to Production so anyone can
+sign in; set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` here.
+`GOOGLE_REDIRECT_URI` is optional — it defaults to this service's own
+callback URL.
