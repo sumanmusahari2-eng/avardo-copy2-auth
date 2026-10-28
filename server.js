@@ -125,6 +125,8 @@ async function ensureSchema() {
   await pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS busan_status TEXT NOT NULL DEFAULT \'\';');
   await pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS busan_order_id TEXT NOT NULL DEFAULT \'\';');
   await pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS busan_error TEXT NOT NULL DEFAULT \'\';');
+  // Reseller flag (idempotent; existing DBs gain it on boot).
+  await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS is_reseller BOOLEAN NOT NULL DEFAULT FALSE;');
 }
 
 // Tiny in-memory rate limiter for the auth routes (per IP, rolling window).
@@ -144,7 +146,7 @@ function validEmail(email) {
 }
 
 function publicUser(row) {
-  return { id: row.id, email: row.email, name: row.name, created_at: row.created_at };
+  return { id: row.id, email: row.email, name: row.name, created_at: row.created_at, is_reseller: !!row.is_reseller };
 }
 
 function signToken(user) {
@@ -227,7 +229,7 @@ function requireAuth(req, res, next) {
 app.get('/api/auth/me', requireAuth, async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Auth service is not connected to a database yet.' });
   try {
-    const { rows } = await pool.query('SELECT id, email, name, created_at FROM users WHERE id = $1', [req.user.id]);
+    const { rows } = await pool.query('SELECT id, email, name, created_at, is_reseller FROM users WHERE id = $1', [req.user.id]);
     if (rows.length === 0) return res.status(401).json({ error: 'Account not found.' });
     res.json({ user: publicUser(rows[0]) });
   } catch (err) {
@@ -247,7 +249,36 @@ app.get('/api/store', async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT data FROM store_data WHERE id = 1');
     if (rows.length === 0) return res.json({ configured: false });
-    res.json({ configured: true, ...rows[0].data });
+    const data = rows[0].data;
+    // Reseller prices are privileged: only a signed-in reseller or the admin
+    // receives them. Everyone else gets the same data with resellerPrice
+    // stripped, so regular visitors can never read reseller rates.
+    let privileged = false;
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+    if (token && JWT_SECRET) {
+      try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        if (decoded.email === ADMIN_EMAIL) {
+          privileged = true;
+        } else {
+          const u = await pool.query('SELECT is_reseller FROM users WHERE id = $1', [decoded.id]);
+          if (u.rows.length && u.rows[0].is_reseller) privileged = true;
+        }
+      } catch {
+        // Bad/expired token: fall through as an anonymous visitor.
+      }
+    }
+    if (privileged) return res.json({ configured: true, ...data });
+    const stripped = JSON.parse(JSON.stringify(data));
+    if (Array.isArray(stripped.games)) {
+      for (const g of stripped.games) {
+        if (g && Array.isArray(g.packs)) {
+          for (const p of g.packs) delete p.resellerPrice;
+        }
+      }
+    }
+    res.json({ configured: true, ...stripped });
   } catch (err) {
     console.error('store read failed:', err);
     res.status(500).json({ error: 'Could not load store data.' });
@@ -348,11 +379,42 @@ app.post('/api/orders', requireAuth, rateLimit, async (req, res) => {
   const pack = cleanStr(req.body.pack, 200);
   const playerId = cleanStr(req.body.player_id, 100);
   const zoneId = cleanStr(req.body.zone_id, 100);
-  const price = Number(req.body.price);
+  let price = Number(req.body.price);
   const method = req.body.payment_method;
   const couponCode = cleanStr(req.body.coupon_code, 50).toUpperCase();
   if (!game || !pack || !playerId || !Number.isInteger(price) || price < 0 || (method !== 'wallet' && method !== 'whatsapp')) {
     return res.status(400).json({ error: 'Invalid order details.' });
+  }
+  // Reseller pricing: the charged price is resolved server-side from the
+  // saved store data, never taken from the client. A reseller pays the
+  // pack's reseller price when one is set, otherwise the regular price;
+  // everyone else always pays the regular price.
+  try {
+    const me = await pool.query('SELECT is_reseller FROM users WHERE id = $1', [req.user.id]);
+    const buyerIsReseller = !!(me.rows.length && me.rows[0].is_reseller);
+    const sd = await pool.query('SELECT data FROM store_data WHERE id = 1');
+    if (sd.rows.length) {
+      const games = sd.rows[0].data && sd.rows[0].data.games;
+      let resolved = null;
+      if (Array.isArray(games)) {
+        const g = games.find((x) => x && x.name === game);
+        const p = g && Array.isArray(g.packs)
+          ? g.packs.find((x) => x && (x.amt === pack || x.name === pack || x.label === pack || x.title === pack))
+          : null;
+        if (p && Number.isFinite(Number(p.price))) {
+          const regular = Number(p.price);
+          const rp = p.resellerPrice !== undefined && p.resellerPrice !== '' && p.resellerPrice !== null ? Number(p.resellerPrice) : null;
+          resolved = (buyerIsReseller && rp !== null && Number.isFinite(rp) && rp >= 0) ? rp : regular;
+        }
+      }
+      if (resolved === null) {
+        return res.status(400).json({ error: 'Price could not be verified for this pack. Refresh the store and try again.' });
+      }
+      price = Math.trunc(resolved);
+    }
+  } catch (err) {
+    console.error('order price resolve failed:', err);
+    return res.status(500).json({ error: 'Could not verify the price.' });
   }
   const client = await pool.connect();
   try {
@@ -737,6 +799,38 @@ async function fulfilBusanOrder(orderId) {
 // browser never sees the Busan mapping — it sends game/pack names and the
 // backend resolves the mapped product. Unmapped packs and a missing key
 // return a plain status instead of an error so checkout is never blocked.
+// ---- Resellers: admin grants/revokes reseller status per account ----
+// A reseller pays the per-pack reseller price (when the admin set one)
+// instead of the regular price. Status is admin-only; the storefront never
+// decides it.
+app.get('/api/admin/resellers', requireAuth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Auth service is not connected to a database yet.' });
+  if (!isAdmin(req)) return res.status(403).json({ error: 'Admin access only.' });
+  try {
+    const { rows } = await pool.query('SELECT id, email, name, created_at FROM users WHERE is_reseller = TRUE ORDER BY email');
+    res.json({ resellers: rows });
+  } catch (err) {
+    console.error('resellers list failed:', err);
+    res.status(500).json({ error: 'Could not load resellers.' });
+  }
+});
+
+app.post('/api/admin/resellers', requireAuth, rateLimit, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Auth service is not connected to a database yet.' });
+  if (!isAdmin(req)) return res.status(403).json({ error: 'Admin access only.' });
+  const email = cleanStr(req.body.email, 200).toLowerCase();
+  const make = req.body.reseller === true;
+  if (!validEmail(email)) return res.status(400).json({ error: 'Enter a valid email.' });
+  try {
+    const { rows } = await pool.query('UPDATE users SET is_reseller = $2 WHERE email = $1 RETURNING id, email, name', [email, make]);
+    if (rows.length === 0) return res.status(404).json({ error: 'No account with that email.' });
+    res.json({ ok: true, user: rows[0], reseller: make });
+  } catch (err) {
+    console.error('reseller set failed:', err);
+    res.status(500).json({ error: 'Could not update reseller status.' });
+  }
+});
+
 app.post('/api/games/check-id', rateLimit, async (req, res) => {
   const game = cleanStr(req.body.game, 200);
   const pack = cleanStr(req.body.pack, 200);
