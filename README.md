@@ -57,3 +57,36 @@ callback URL.
   (the signed-in email must be Sumanmusahari@gmail.com). Body is the store
   data JSON (games, WhatsApp number, theme, support note, ...), saved as one
   row and served to all visitors by `GET /api/store`.
+
+## Phase 1: orders & wallet
+
+Coins: 1 coin = ₹1. Wallet payments deduct immediately and the order
+becomes `paid` (awaiting delivery); WhatsApp orders stay `pending` until the
+admin confirms payment. Order statuses: `pending` → `paid` → `delivered`,
+and `pending`/`paid` → `cancelled`. Cancelling a paid wallet order refunds
+it to the wallet. Only the admin (Sumanmusahari@gmail.com) may change order
+status or decide top-up requests.
+
+- `GET /api/wallet/me` — Bearer token. Returns `{ balance, ledger }`
+  (latest 50 entries).
+- `POST /api/wallet/topup-request` — Bearer token. Body `{ amount, note }`
+  (1–100000 coins). Creates a pending top-up request for the admin to
+  approve; approval credits the wallet.
+- `POST /api/orders` — Bearer token. Body `{ game, pack, price, player_id,
+  zone_id, payment_method }` where `payment_method` is `wallet` or
+  `whatsapp`. Returns the order with code `CP2-<id>`. Wallet orders fail
+  with 400 when the balance is short; nothing is created on failure.
+- `GET /api/orders/me` — Bearer token. The signed-in user's orders, newest
+  first.
+- `GET /api/orders/:id` — Bearer token. The order, only for its owner or
+  the admin (404 otherwise).
+- `GET /api/admin/orders` — Bearer token, admin only. All orders, newest
+  first, optional `?status=` filter, with the buyer's email.
+- `POST /api/admin/orders/:id/status` — Bearer token, admin only. Body
+  `{ status }` (`paid`, `delivered` or `cancelled`, following the allowed
+  transitions above).
+- `GET /api/admin/topup-requests` — Bearer token, admin only. All requests,
+  pending first, with the buyer's email.
+- `POST /api/admin/topup-requests/:id/decision` — Bearer token, admin
+  only. Body `{ decision }` (`approved` or `rejected`); approval credits
+  the wallet and writes a ledger entry.
