@@ -12,6 +12,7 @@ const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
+const busan = require('./busan');
 
 const app = express();
 app.use(express.json({ limit: '512kb' }));
@@ -120,6 +121,10 @@ async function ensureSchema() {
   );
   await pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS coupon_code TEXT NOT NULL DEFAULT \'\';');
   await pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount INTEGER NOT NULL DEFAULT 0;');
+  // Phase 3: Busan fulfilment outcome per order (idempotent; existing DBs gain them on boot).
+  await pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS busan_status TEXT NOT NULL DEFAULT \'\';');
+  await pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS busan_order_id TEXT NOT NULL DEFAULT \'\';');
+  await pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS busan_error TEXT NOT NULL DEFAULT \'\';');
 }
 
 // Tiny in-memory rate limiter for the auth routes (per IP, rolling window).
@@ -296,6 +301,9 @@ function orderOut(row) {
     payment_method: row.payment_method,
     coupon_code: row.coupon_code || '',
     discount: row.discount || 0,
+    busan_status: row.busan_status || '',
+    busan_order_id: row.busan_order_id || '',
+    busan_error: row.busan_error || '',
     status: row.status,
     created_at: row.created_at,
     updated_at: row.updated_at,
@@ -388,6 +396,7 @@ app.post('/api/orders', requireAuth, rateLimit, async (req, res) => {
       await client.query('INSERT INTO wallet_ledger (user_id, delta, kind, ref) VALUES ($1, $2, $3, $4)', [req.user.id, -finalPrice, 'order_payment', `CP2-${order.id}`]);
     }
     await client.query('COMMIT');
+    if (method === 'wallet') fulfilBusanOrder(order.id).catch((e) => console.error('busan fulfil failed:', e.message));
     res.status(201).json(orderOut(order));
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
@@ -476,6 +485,7 @@ app.post('/api/admin/orders/:id/status', requireAuth, rateLimit, async (req, res
       await client.query('INSERT INTO wallet_ledger (user_id, delta, kind, ref) VALUES ($1, $2, $3, $4)', [order.user_id, order.price, 'order_refund', `CP2-${order.id}`]);
     }
     await client.query('COMMIT');
+    if (next === 'paid') fulfilBusanOrder(id).catch((e) => console.error('busan fulfil failed:', e.message));
     res.json({ ok: true, status: next });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
@@ -647,6 +657,160 @@ app.post('/api/admin/coupons/:id/toggle', requireAuth, rateLimit, async (req, re
   } catch (err) {
     console.error('coupon toggle failed:', err);
     res.status(500).json({ error: 'Could not update the coupon.' });
+  }
+});
+
+// ---- Phase 3: Busan (1gamestopup) connection ----
+// Key-gated: with no BUSAN_API_KEY set, every Busan path degrades
+// gracefully (check-id reports unmapped/unconfigured, fulfilment skips,
+// admin status reports configured:false) and orders behave exactly as
+// before — manual delivery by the admin. Nothing here ever throws into a
+// payment or status flow, and a failed Busan attempt never marks an order
+// delivered: the order stays paid with busan_status='failed' so the admin
+// can fix the cause (key, balance, mapping) and retry.
+//
+// Mapping: each pack in the admin-saved store_data games list may carry a
+// busanProductId. Orders store game/pack as display names, so the mapping
+// lookup matches those names (trimmed, case-insensitive) against the saved
+// catalogue.
+async function findBusanMapping(game, pack) {
+  if (!pool) return '';
+  try {
+    const { rows } = await pool.query('SELECT data FROM store_data WHERE id = 1');
+    if (rows.length === 0) return '';
+    const games = rows[0].data && Array.isArray(rows[0].data.games) ? rows[0].data.games : [];
+    const g = games.find((x) => String((x && x.name) || '').trim().toLowerCase() === String(game || '').trim().toLowerCase());
+    if (!g || !Array.isArray(g.packs)) return '';
+    const p = g.packs.find((x) => String((x && x.name) || '').trim().toLowerCase() === String(pack || '').trim().toLowerCase());
+    if (!p) return '';
+    return String(p.busanProductId || '').trim();
+  } catch (err) {
+    console.error('busan mapping lookup failed:', err);
+    return '';
+  }
+}
+
+// Fulfil one paid order through Busan. Idempotent: an order already marked
+// busan_status='success' is never re-sent (real wallet spend per duplicate).
+// Returns { status } where status is 'success' | 'failed' | 'skipped'.
+async function fulfilBusanOrder(orderId) {
+  if (!pool) return { status: 'skipped', reason: 'no_db' };
+  const { rows } = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
+  if (rows.length === 0) return { status: 'skipped', reason: 'not_found' };
+  const order = rows[0];
+  if (order.status !== 'paid') return { status: 'skipped', reason: 'not_paid' };
+  if (order.busan_status === 'success') return { status: 'skipped', reason: 'already_fulfilled' };
+  const productId = await findBusanMapping(order.game, order.pack);
+  if (!productId) return { status: 'skipped', reason: 'unmapped' };
+  if (!busan.configured()) return { status: 'skipped', reason: 'not_configured' };
+  try {
+    // Validate first so wallet balance is never burned on a bad player ID.
+    const v = await busan.validatePlayer(productId, order.player_id, order.zone_id || undefined);
+    const vd = (v && v.data) || {};
+    if (vd.valid === false) throw new Error('player validation failed');
+    const res = await busan.createOrder(productId, order.player_id, order.zone_id || undefined);
+    const d = (res && res.data) || {};
+    const busanOrderId = d.orderId || d.order_id || '';
+    if (!busan.isSuccess(res)) {
+      throw new Error('Busan non-success response: ' + JSON.stringify(res).slice(0, 200));
+    }
+    await pool.query(
+      `UPDATE orders SET status = 'delivered', busan_status = 'success', busan_order_id = $1, busan_error = '', updated_at = NOW() WHERE id = $2`,
+      [String(busanOrderId), orderId]
+    );
+    return { status: 'success', busan_order_id: String(busanOrderId) };
+  } catch (err) {
+    const msg = String((err && err.message) || 'unknown error').slice(0, 300);
+    console.error(`[busan] order ${orderId} failed:`, msg);
+    await pool.query(
+      `UPDATE orders SET busan_status = 'failed', busan_error = $1, updated_at = NOW() WHERE id = $2`,
+      [msg, orderId]
+    ).catch(() => {});
+    return { status: 'failed', error: msg };
+  }
+}
+
+// Player ID check for the top-up panel. Public but rate-limited; the
+// browser never sees the Busan mapping — it sends game/pack names and the
+// backend resolves the mapped product. Unmapped packs and a missing key
+// return a plain status instead of an error so checkout is never blocked.
+app.post('/api/games/check-id', rateLimit, async (req, res) => {
+  const game = cleanStr(req.body.game, 200);
+  const pack = cleanStr(req.body.pack, 200);
+  const playerId = cleanStr(req.body.player_id, 100);
+  const zoneId = cleanStr(req.body.zone_id, 100);
+  if (!game || !pack || !playerId) return res.status(400).json({ error: 'Game, pack and player ID are required.' });
+  const productId = await findBusanMapping(game, pack);
+  if (!productId) return res.json({ mapped: false });
+  if (!busan.configured()) return res.json({ configured: false });
+  try {
+    const v = await busan.validatePlayer(productId, playerId, zoneId || undefined);
+    const vd = (v && v.data) || {};
+    res.json({
+      mapped: true,
+      valid: vd.valid !== false,
+      username: vd.username ? String(vd.username) : '',
+      player_id: vd.playerId ? String(vd.playerId) : playerId,
+      zone_id: vd.zoneId ? String(vd.zoneId) : zoneId,
+    });
+  } catch (err) {
+    console.error('busan check-id failed:', err);
+    res.status(502).json({ error: 'ID check failed: ' + String(err.message || 'unknown error').slice(0, 200) });
+  }
+});
+
+app.get('/api/admin/busan/status', requireAuth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Auth service is not connected to a database yet.' });
+  if (!isAdmin(req)) return res.status(403).json({ error: 'Admin access only.' });
+  if (!busan.configured()) return res.json({ configured: false });
+  try {
+    const bal = await busan.getBalance();
+    res.json({ configured: true, balance: bal.balance, currency: bal.currency });
+  } catch (err) {
+    console.error('busan balance failed:', err);
+    res.json({ configured: true, error: String(err.message || 'unknown error').slice(0, 200) });
+  }
+});
+
+app.get('/api/admin/busan/products', requireAuth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Auth service is not connected to a database yet.' });
+  if (!isAdmin(req)) return res.status(403).json({ error: 'Admin access only.' });
+  if (!busan.configured()) return res.status(400).json({ error: 'Busan is not connected yet.' });
+  try {
+    const list = await busan.getProducts();
+    res.json({
+      products: list.map((p) => ({
+        productId: p.productId != null ? String(p.productId) : '',
+        productName: p.productName != null ? String(p.productName) : '',
+        price: p.price != null ? String(p.price) : '',
+      })),
+    });
+  } catch (err) {
+    console.error('busan products failed:', err);
+    res.status(502).json({ error: 'Could not load the Busan catalogue: ' + String(err.message || 'unknown error').slice(0, 200) });
+  }
+});
+
+app.post('/api/admin/orders/:id/fulfil', requireAuth, rateLimit, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Auth service is not connected to a database yet.' });
+  if (!isAdmin(req)) return res.status(403).json({ error: 'Admin access only.' });
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(404).json({ error: 'Order not found.' });
+  try {
+    const { rows } = await pool.query('SELECT * FROM orders WHERE id = $1', [id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Order not found.' });
+    const order = rows[0];
+    if (order.status !== 'paid') return res.status(400).json({ error: 'Only paid orders can be fulfilled.' });
+    if (order.busan_status === 'success') return res.status(400).json({ error: 'This order was already fulfilled through Busan.' });
+    const productId = await findBusanMapping(order.game, order.pack);
+    if (!productId) return res.status(400).json({ error: 'This pack is not mapped to a Busan product yet.' });
+    if (!busan.configured()) return res.status(400).json({ error: 'Busan is not connected yet — add the API key first.' });
+    const result = await fulfilBusanOrder(id);
+    if (result.status === 'success') return res.json({ ok: true, busan_status: 'success', busan_order_id: result.busan_order_id || '' });
+    return res.status(502).json({ ok: false, busan_status: 'failed', error: result.error || 'Fulfilment failed.' });
+  } catch (err) {
+    console.error('busan fulfil retry failed:', err);
+    res.status(500).json({ error: 'Could not fulfil the order.' });
   }
 });
 
