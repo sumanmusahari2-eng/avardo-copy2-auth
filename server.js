@@ -1,10 +1,15 @@
-// Avardo Copy 2 — auth service (email + password login for the store).
-// Serves the static storefront's sign-up / sign-in: register, login, me.
+// Avardo Copy 2 — auth service (email + password + Google login for the store).
+// Serves the static storefront's sign-up / sign-in: register, login, me,
+// plus Google sign-in (redirect to Google, callback finds-or-creates the
+// account and returns the store to its origin with #token=<jwt>).
 // Stateless JWT auth: the store keeps the token and sends it as a Bearer token.
 // Env: DATABASE_URL (Neon Postgres), JWT_SECRET (long random string),
-//      CORS_ORIGIN (comma-separated allowed origins; defaults to the Render store).
+//      CORS_ORIGIN (comma-separated allowed origins; defaults to the Render store),
+//      GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET (for Google sign-in),
+//      GOOGLE_REDIRECT_URI (optional; defaults to this service's callback URL).
 const express = require('express');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
 
@@ -154,6 +159,91 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
   } catch (err) {
     console.error('me failed:', err);
     res.status(500).json({ error: 'Could not load the account.' });
+  }
+});
+
+// ---- Google sign-in ----
+// GET /api/auth/google starts the flow; Google redirects back to
+// /api/auth/google/callback, which finds or creates the account by email,
+// then returns the browser to the store with #token=<jwt> in the URL hash
+// (a hash, so the token never lands in server logs). The storefront reads
+// the hash on load, saves the token, and clears it from the address bar.
+function googleRedirectUri(req) {
+  if (process.env.GOOGLE_REDIRECT_URI) return process.env.GOOGLE_REDIRECT_URI;
+  return `https://${req.get('host')}/api/auth/google/callback`;
+}
+
+app.get('/api/auth/google', (req, res) => {
+  if (!process.env.GOOGLE_CLIENT_ID) {
+    return res.status(503).send('Google sign-in is not configured yet.');
+  }
+  const state = crypto.randomBytes(16).toString('hex');
+  res.cookie('gstate', state, {
+    httpOnly: true, sameSite: 'lax', secure: true,
+    maxAge: 10 * 60 * 1000, path: '/api/auth/google',
+  });
+  const params = new URLSearchParams({
+    client_id: process.env.GOOGLE_CLIENT_ID,
+    redirect_uri: googleRedirectUri(req),
+    response_type: 'code',
+    scope: 'openid email profile',
+    state,
+    prompt: 'select_account',
+  });
+  res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params}`);
+});
+
+app.get('/api/auth/google/callback', async (req, res) => {
+  const storeOrigin = CORS_ORIGINS[0] || '';
+  const fail = (msg) => res.redirect(`${storeOrigin}/#auth_error=${encodeURIComponent(msg)}`);
+  try {
+    if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET || !pool || !JWT_SECRET) {
+      return fail('Google sign-in is not configured yet.');
+    }
+    const cookieHeader = req.headers.cookie || '';
+    const stateCookie = cookieHeader.split(';').map((s) => s.trim()).find((s) => s.startsWith('gstate='));
+    if (!req.query.code || !req.query.state || !stateCookie || req.query.state !== stateCookie.slice(7)) {
+      return fail('Google sign-in failed. Try again.');
+    }
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code: req.query.code,
+        client_id: process.env.GOOGLE_CLIENT_ID,
+        client_secret: process.env.GOOGLE_CLIENT_SECRET,
+        redirect_uri: googleRedirectUri(req),
+        grant_type: 'authorization_code',
+      }),
+    });
+    const tokens = await tokenRes.json();
+    if (!tokens.access_token) return fail('Google sign-in failed. Try again.');
+    const meRes = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
+      headers: { Authorization: `Bearer ${tokens.access_token}` },
+    });
+    const profile = await meRes.json();
+    if (!profile.email) return fail('Google sign-in failed. Try again.');
+    const email = String(profile.email).toLowerCase();
+    const name = typeof profile.name === 'string' ? profile.name.slice(0, 100) : '';
+    const { rows } = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    let user;
+    if (rows.length > 0) {
+      user = publicUser(rows[0]);
+    } else {
+      // Google accounts carry no password: store a random unusable hash so
+      // nobody can sign in to this account with a guessed password.
+      const hash = await bcrypt.hash(crypto.randomBytes(32).toString('hex'), 10);
+      const ins = await pool.query(
+        'INSERT INTO users (email, password_hash, name) VALUES ($1, $2, $3) RETURNING id, email, name, created_at',
+        [email, hash, name]
+      );
+      user = publicUser(ins.rows[0]);
+    }
+    res.clearCookie('gstate', { path: '/api/auth/google' });
+    res.redirect(`${storeOrigin}/#token=${signToken(user)}`);
+  } catch (err) {
+    console.error('google callback failed:', err);
+    fail('Google sign-in failed. Try again.');
   }
 });
 
