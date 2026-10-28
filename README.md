@@ -91,6 +91,40 @@ status or decide top-up requests.
   only. Body `{ decision }` (`approved` or `rejected`); approval credits
   the wallet and writes a ledger entry.
 
+## Phase 3: Busan (1gamestopup) connection
+
+- `POST /api/games/check-id` — public, rate-limited. Body `{ game, pack,
+  player_id, zone_id? }`. The backend resolves the pack's Busan product
+  from the admin-saved catalogue and validates the player ID, returning
+  `{ mapped, valid, username, player_id, zone_id }`. Unmapped packs return
+  `{ mapped: false }`; a missing API key returns `{ configured: false }`
+  — checkout is never blocked by the ID check.
+- `GET /api/admin/busan/status` — Bearer token, admin only. Returns
+  `{ configured, balance, currency }` (or `{ configured: false }` when
+  no key is set) so the admin can confirm the connection and wallet.
+- `GET /api/admin/busan/products` — Bearer token, admin only. The Busan
+  catalogue (`productId`, `productName`, USD price, cached 10 minutes)
+  for picking pack mappings.
+- `POST /api/admin/orders/:id/fulfil` — Bearer token, admin only. Retries
+  Busan fulfilment for a paid order (used after a failed attempt, once
+  the key, balance or mapping is fixed).
+
+Auto-fulfilment: when an order becomes `paid` (admin marks it paid, or a
+wallet order is created paid), the backend looks up the pack's
+`busanProductId` in the saved catalogue. If the pack is mapped and the
+key is set, it validates the player first, then places the Busan order
+(USD wallet). On success the order flips to `delivered` automatically;
+on failure it stays `paid` with `busan_status='failed'` and the error
+recorded, so the admin can retry or deliver manually. Unmapped packs and
+a missing key simply skip fulfilment — delivery stays manual, as before.
+One Busan order per Copy 2 order, and an order already marked
+`busan_status='success'` is never re-sent. Order responses include
+`busan_status`, `busan_order_id` and `busan_error`.
+
+Env: `BUSAN_API_KEY` — the 1gamestopup.com API key. Never logged,
+never returned to the browser, never written to a file. Without it the
+whole Busan layer degrades gracefully (see above).
+
 ## Phase 4: best sellers + coupons
 
 - `GET /api/stats/best-sellers` — public, aggregate only. Games ranked by
