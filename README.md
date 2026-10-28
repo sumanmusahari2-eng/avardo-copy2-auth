@@ -90,3 +90,20 @@ status or decide top-up requests.
 - `POST /api/admin/topup-requests/:id/decision` — Bearer token, admin
   only. Body `{ decision }` (`approved` or `rejected`); approval credits
   the wallet and writes a ledger entry.
+
+## Phase 4: best sellers + coupons
+
+- `GET /api/stats/best-sellers` — public, aggregate only. Games ranked by
+  delivered-order count (from the orders table), top 10.
+- `POST /api/coupons/validate` — Bearer token. Body `{ code, price }`.
+  Returns `{ valid, discount, final_price }` (or `valid: false` with an
+  error). Checking does not consume the coupon; placing an order with
+  `coupon_code` validates and consumes it in the same transaction, and the
+  order stores the final price plus `coupon_code` and `discount`.
+- `GET /api/admin/coupons` — Bearer token, admin only. All coupons.
+- `POST /api/admin/coupons` — Bearer token, admin only. Body `{ code,
+  kind, value, max_uses, expires_at }` where `kind` is `percent` (1–100)
+  or `flat` (₹); `max_uses` and `expires_at` are optional (null = no
+  limit). Codes are stored uppercased.
+- `POST /api/admin/coupons/:id/toggle` — Bearer token, admin only. Body
+  `{ active }` to switch a coupon on or off.
