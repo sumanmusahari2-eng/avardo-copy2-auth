@@ -583,7 +583,8 @@ app.get('/api/payments/upi/status', requireAuth, async (req, res) => {
     const { rows } = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
     if (rows.length === 0 || (rows[0].user_id !== req.user.id && !isAdmin(req))) return res.status(404).json({ error: 'Order not found.' });
     const order = rows[0];
-    if (order.status === 'paid' || order.status === 'delivered') {
+    // Terminal statuses never flip back from a later gateway check.
+    if (order.status === 'paid' || order.status === 'delivered' || order.status === 'cancelled' || order.status === 'refunded') {
       return res.json({ order_id: orderId, status: order.status, gateway: order.xtra_status || null, utr: order.xtra_utr || null });
     }
     if (!order.xtra_order_id) {
@@ -739,7 +740,7 @@ app.get('/api/admin/orders', requireAuth, async (req, res) => {
   try {
     const args = [];
     let where = '';
-    if (['pending', 'paid', 'delivered', 'cancelled'].includes(status)) {
+    if (['pending', 'paid', 'delivered', 'cancelled', 'refunded'].includes(status)) {
       where = 'WHERE o.status = $1';
       args.push(status);
     }
@@ -759,7 +760,7 @@ app.post('/api/admin/orders/:id/status', requireAuth, rateLimit, async (req, res
   if (!isAdmin(req)) return res.status(403).json({ error: 'Admin access only.' });
   const id = Number(req.params.id);
   const next = req.body.status;
-  const allowed = { pending: ['paid', 'delivered', 'cancelled'], paid: ['delivered', 'cancelled'] };
+  const allowed = { pending: ['paid', 'delivered', 'cancelled'], paid: ['delivered', 'cancelled', 'refunded'], delivered: ['refunded'] };
   if (!Number.isInteger(id) || typeof next !== 'string') return res.status(400).json({ error: 'Invalid status change.' });
   const client = await pool.connect();
   try {
@@ -775,7 +776,14 @@ app.post('/api/admin/orders/:id/status', requireAuth, rateLimit, async (req, res
       return res.status(400).json({ error: `Cannot move an order from ${order.status} to ${next}.` });
     }
     await client.query('UPDATE orders SET status = $1, updated_at = NOW() WHERE id = $2', [next, id]);
-    if (next === 'cancelled' && order.status === 'paid' && order.payment_method === 'wallet') {
+    // Wallet refund: cancelling a paid wallet order refunds it (existing behaviour),
+    // and marking a paid OR delivered wallet order as refunded credits the price back.
+    // UPI/WhatsApp refunds are a status record only — the money itself is returned
+    // outside the system, so no wallet credit happens for those methods.
+    const walletRefund = order.payment_method === 'wallet' &&
+      ((next === 'cancelled' && order.status === 'paid') ||
+       (next === 'refunded' && (order.status === 'paid' || order.status === 'delivered')));
+    if (walletRefund) {
       await client.query(
         `INSERT INTO wallets (user_id, balance) VALUES ($1, $2)
          ON CONFLICT (user_id) DO UPDATE SET balance = wallets.balance + EXCLUDED.balance, updated_at = NOW()`,
