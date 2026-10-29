@@ -1105,7 +1105,12 @@ app.post('/api/games/check-id', rateLimit, async (req, res) => {
     });
   } catch (err) {
     console.error('busan check-id failed:', err);
-    res.status(502).json({ error: 'ID check failed: ' + String(err.message || 'unknown error').slice(0, 200) });
+    const msg = String(err.message || '');
+    const supplierDown = /non-JSON|timed out|HTTP 50|HTTP 429|fetch failed|network/i.test(msg);
+    const plain = supplierDown
+      ? 'ID check is temporarily unavailable. Please try again in a bit.'
+      : 'Your User ID or Zone ID is wrong. Please check your in-game profile and try again.';
+    res.status(502).json({ error: plain });
   }
 });
 
