@@ -1282,9 +1282,24 @@ async function backfillIndiaCheckMapping() {
         if (want && !p.busanCheckProductId) { p.busanCheckProductId = want; changed++; }
       }
     }
+    // Fulfilment switch (ordered 2026-10-29): the same 7 generic packs also
+    // get busanProductId, so paid orders auto-deliver through Busan.
+    // Deliberately limited to packs proven to validate for India accounts;
+    // prices are still below Busan cost at the time of this switch, so
+    // each auto-fulfilled order loses money until prices are raised.
+    let fulfilChanged = 0;
+    for (const g of data.games) {
+      if (!g || g.id !== 'mlbb-in') continue;
+      if (!Array.isArray(g.packs)) continue;
+      for (const p of g.packs) {
+        const want = MAP[p && p.amt];
+        if (want && !p.busanProductId) { p.busanProductId = want; fulfilChanged++; }
+      }
+    }
+    if (fulfilChanged) changed += fulfilChanged;
     if (changed) {
       await pool.query('UPDATE store_data SET data = $1::jsonb, updated_at = NOW() WHERE id = 1', [JSON.stringify(data)]);
-      console.log(`india check mapping backfilled for ${changed} packs`);
+      console.log(`india check mapping backfilled for ${changed} packs (${fulfilChanged} fulfilment)`);
     }
   } catch (err) {
     console.error('india check mapping backfill failed:', err);
