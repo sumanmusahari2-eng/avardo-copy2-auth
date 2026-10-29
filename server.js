@@ -662,9 +662,15 @@ app.post('/api/region-check', rateLimit, async (req, res) => {
   const specific = validated.filter((x) => x.route !== 'Generic' && x.route !== 'Indonesia');
   let recommended = null;
   let note = '';
-  if (specific.length > 0) {
+  if (specific.length === 1) {
     recommended = specific[0].game;
-    if (specific.length > 1) note = 'More than one route validated this ID — pick the country where the account was created.';
+  } else if (specific.length > 1) {
+    // Validation alone cannot pinpoint a region when several routes validate
+    // the same ID (proven 2026-10-29: an India account validated on
+    // Philippines, Brazil, US, SG/MY and Generic). Recommending the first
+    // match would send the customer to the wrong game, so recommend nothing
+    // and let the customer pick the country where the account was created.
+    note = 'This ID validated on more than one route, so validation alone cannot pinpoint your region. Pick the country where the account was created.';
   } else if (validated.some((x) => x.route === 'Generic')) {
     recommended = 'Mobile Legends — India';
     note = 'Only the generic route validated this ID. On this store that route is used for MLBB India.';
