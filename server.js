@@ -682,6 +682,30 @@ app.post('/api/region-check', rateLimit, async (req, res) => {
   res.json({ username, validated: validated.map((x) => x.route), recommended, note });
 });
 
+app.get('/api/leaderboard', async (req, res) => {
+  if (!pool) return res.json({ leaders: [] });
+  try {
+    const { rows } = await pool.query(
+      `SELECT u.name AS name, u.email AS email, COALESCE(SUM(o.price), 0) AS total_spent, COUNT(*) AS order_count
+       FROM orders o JOIN users u ON u.id = o.user_id
+       WHERE o.status IN ('paid', 'delivered')
+       GROUP BY u.id, u.name, u.email
+       ORDER BY total_spent DESC, order_count DESC
+       LIMIT 10`
+    );
+    const leaders = rows.map((r) => {
+      const raw = (r.name || '').trim() || (r.email || '').split('@')[0] || 'Player';
+      const clean = raw.replace(/\s+/g, ' ');
+      const masked = clean.length <= 2 ? clean[0] + '***' : clean[0] + '***' + clean[clean.length - 1];
+      return { name: masked, total_spent: Number(r.total_spent) || 0, order_count: Number(r.order_count) || 0 };
+    });
+    res.json({ leaders });
+  } catch (err) {
+    console.error('leaderboard failed:', err);
+    res.json({ leaders: [] });
+  }
+});
+
 app.get('/api/orders/me', requireAuth, async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Auth service is not connected to a database yet.' });
   try {
