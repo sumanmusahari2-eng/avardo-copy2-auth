@@ -874,6 +874,27 @@ app.post('/api/admin/coupons/:id/toggle', requireAuth, rateLimit, async (req, re
 // busanProductId. Orders store game/pack as display names, so the mapping
 // lookup matches those names (trimmed, case-insensitive) against the saved
 // catalogue.
+// Check-ID-only mapping: a pack's busanCheckProductId is used for the
+// Check ID button only and never triggers auto-fulfilment. Fulfilment still
+// requires busanProductId, so a check mapping can never cause a wallet spend.
+async function findBusanCheckMapping(game, pack) {
+  if (!pool) return '';
+  try {
+    const { rows } = await pool.query('SELECT data FROM store_data WHERE id = 1');
+    if (rows.length === 0) return '';
+    const games = rows[0].data && Array.isArray(rows[0].data.games) ? rows[0].data.games : [];
+    const g = games.find((x) => String((x && x.name) || '').trim().toLowerCase() === String(game || '').trim().toLowerCase());
+    if (!g || !Array.isArray(g.packs)) return '';
+    const packName = (x) => String((x && (x.amt || x.name || x.label || x.title)) || '').trim().toLowerCase();
+    const p = g.packs.find((x) => packName(x) === String(pack || '').trim().toLowerCase());
+    if (!p) return '';
+    return String(p.busanCheckProductId || p.busanProductId || '').trim();
+  } catch (err) {
+    console.error('busan check mapping lookup failed:', err);
+    return '';
+  }
+}
+
 async function findBusanMapping(game, pack) {
   if (!pool) return '';
   try {
@@ -995,7 +1016,7 @@ app.post('/api/games/check-id', rateLimit, async (req, res) => {
   const playerId = cleanStr(req.body.player_id, 100);
   const zoneId = cleanStr(req.body.zone_id, 100);
   if (!game || !pack || !playerId) return res.status(400).json({ error: 'Game, pack and player ID are required.' });
-  const productId = await findBusanMapping(game, pack);
+  const productId = await findBusanCheckMapping(game, pack);
   if (!productId) return res.json({ mapped: false });
   if (!busan.configured()) return res.json({ configured: false });
   try {
@@ -1154,6 +1175,49 @@ app.get('/api/auth/google/callback', async (req, res) => {
   }
 });
 
+
+// One-time backfill (idempotent): give MLBB India packs that match the generic
+// Busan family exactly a busanCheckProductId, so Check ID works on them.
+// Verified 2026-10-29 against a real India player ID: the generic family
+// validates India accounts, while Global/Indonesia families reject them.
+// Fulfilment is deliberately NOT enabled here (busanProductId stays empty) —
+// current India prices sit below Busan cost, so auto-fulfil would lose money
+// until prices are raised.
+async function backfillIndiaCheckMapping() {
+  if (!pool) return;
+  try {
+    const { rows } = await pool.query('SELECT data FROM store_data WHERE id = 1');
+    if (rows.length === 0) return;
+    const data = rows[0].data;
+    if (!data || !Array.isArray(data.games)) return;
+    const MAP = {
+      '86 Diamonds': 'mobile-legends114_86990',
+      '172 Diamonds': 'mobile-legends114_172216',
+      '257 Diamonds': 'mobile-legends114_257547',
+      '514 Diamonds': 'mobile-legends114_514873',
+      '706 Diamonds': 'mobile-legends114_706359',
+      '2195 Diamonds': 'mobile-legends114_2195687',
+      '5532 Diamonds': 'mobile-legends114_5532521',
+    };
+    let changed = 0;
+    for (const g of data.games) {
+      if (!g || g.id !== 'mlbb-in') continue;
+      if (!Array.isArray(g.packs)) continue;
+      for (const p of g.packs) {
+        const want = MAP[p && p.amt];
+        if (want && !p.busanCheckProductId) { p.busanCheckProductId = want; changed++; }
+      }
+    }
+    if (changed) {
+      await pool.query('UPDATE store_data SET data = $1::jsonb, updated_at = NOW() WHERE id = 1', [JSON.stringify(data)]);
+      console.log(`india check mapping backfilled for ${changed} packs`);
+    }
+  } catch (err) {
+    console.error('india check mapping backfill failed:', err);
+  }
+}
+
 ensureSchema()
+  .then(() => backfillIndiaCheckMapping())
   .catch((err) => console.error('schema setup failed (will retry per-request):', err))
   .finally(() => app.listen(PORT, () => console.log(`avardo-copy2-auth listening on ${PORT}`)));
