@@ -125,6 +125,12 @@ async function ensureSchema() {
   await pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS busan_status TEXT NOT NULL DEFAULT \'\';');
   await pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS busan_order_id TEXT NOT NULL DEFAULT \'\';');
   await pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS busan_error TEXT NOT NULL DEFAULT \'\';');
+  // PaySafe UPI (XtraGateway) fields on orders (idempotent; existing DBs gain them on boot).
+  await pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_mobile TEXT NOT NULL DEFAULT \'\';');
+  await pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS xtra_order_id TEXT NOT NULL DEFAULT \'\';');
+  await pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS xtra_payment_url TEXT NOT NULL DEFAULT \'\';');
+  await pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS xtra_status TEXT NOT NULL DEFAULT \'\';');
+  await pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS xtra_utr TEXT NOT NULL DEFAULT \'\';');
   // Reseller flag (idempotent; existing DBs gain it on boot).
   await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS is_reseller BOOLEAN NOT NULL DEFAULT FALSE;');
 }
@@ -335,6 +341,11 @@ function orderOut(row) {
     busan_status: row.busan_status || '',
     busan_order_id: row.busan_order_id || '',
     busan_error: row.busan_error || '',
+    customer_mobile: row.customer_mobile || '',
+    xtra_order_id: row.xtra_order_id || '',
+    xtra_payment_url: row.xtra_payment_url || '',
+    xtra_status: row.xtra_status || '',
+    xtra_utr: row.xtra_utr || '',
     status: row.status,
     created_at: row.created_at,
     updated_at: row.updated_at,
@@ -381,8 +392,11 @@ app.post('/api/orders', requireAuth, rateLimit, async (req, res) => {
   const zoneId = cleanStr(req.body.zone_id, 100);
   let price = Number(req.body.price);
   const method = req.body.payment_method;
+  let mobile = cleanStr(req.body.customer_mobile, 20).replace(/\D/g, '');
+  if (mobile.length === 12 && mobile.startsWith('91')) mobile = mobile.slice(2);
+  if (mobile && !/^\d{10}$/.test(mobile)) mobile = '';
   const couponCode = cleanStr(req.body.coupon_code, 50).toUpperCase();
-  if (!game || !pack || !playerId || !Number.isInteger(price) || price < 0 || (method !== 'wallet' && method !== 'whatsapp')) {
+  if (!game || !pack || !playerId || !Number.isInteger(price) || price < 0 || (method !== 'wallet' && method !== 'whatsapp' && method !== 'upi')) {
     return res.status(400).json({ error: 'Invalid order details.' });
   }
   // Reseller pricing: the charged price is resolved server-side from the
@@ -438,10 +452,18 @@ app.post('/api/orders', requireAuth, rateLimit, async (req, res) => {
         : Math.min(couponRow.value, price);
       finalPrice = price - discountAmt;
     }
+    if (method === 'upi' && finalPrice <= 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'UPI payment needs an amount above \u20B90.' });
+    }
+    if (method === 'upi' && !mobile) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Enter a valid 10-digit mobile number for UPI payment.' });
+    }
     const ins = await client.query(
-      `INSERT INTO orders (user_id, game, pack, price, player_id, zone_id, payment_method, status, coupon_code, discount)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
-      [req.user.id, game, pack, finalPrice, playerId, zoneId, method, method === 'wallet' ? 'paid' : 'pending', couponCode, discountAmt]
+      `INSERT INTO orders (user_id, game, pack, price, player_id, zone_id, payment_method, status, coupon_code, discount, customer_mobile)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+      [req.user.id, game, pack, finalPrice, playerId, zoneId, method, method === 'wallet' ? 'paid' : 'pending', couponCode, discountAmt, mobile]
     );
     const order = ins.rows[0];
     if (couponRow) {
@@ -466,6 +488,123 @@ app.post('/api/orders', requireAuth, rateLimit, async (req, res) => {
     res.status(500).json({ error: 'Could not place the order.' });
   } finally {
     client.release();
+  }
+});
+
+// ---- PaySafe UPI (XtraGateway) ----
+// Flow: customer places a 'upi' order (pending) -> POST /api/payments/upi/create
+// returns the gateway payment_url -> customer pays -> gateway redirects back to
+// https://www.avardoofficial.in/?payment_return=<orderId> -> storefront polls
+// GET /api/payments/upi/status, which asks the gateway and flips the order to
+// paid on COMPLETED, firing the same Busan fulfil hook as other paid orders.
+// Env: XTRA_USER_TOKEN (gateway merchant token, required), XTRA_BASE_URL
+// (default https://paysafe.mlbbstore.in).
+const XTRA_BASE = (process.env.XTRA_BASE_URL || 'https://paysafe.mlbbstore.in').replace(/\/+$/, '');
+function xtraEnabled() { return !!((process.env.XTRA_USER_TOKEN || '').trim()); }
+async function xtraPost(path, params) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 25000);
+  try {
+    const body = new URLSearchParams({ user_token: (process.env.XTRA_USER_TOKEN || '').trim(), ...params });
+    const res = await fetch(XTRA_BASE + path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+      signal: ctrl.signal,
+    });
+    const text = await res.text();
+    try { return JSON.parse(text); } catch (_) { return { status: 'ERROR', message: 'Invalid response from payment gateway.' }; }
+  } catch (e) {
+    return { status: 'ERROR', message: 'Could not reach the payment gateway. Please try again.' };
+  } finally { clearTimeout(timer); }
+}
+function xtraCompleted(gw) {
+  const st = String(gw.status || '').toUpperCase();
+  const txn = String((gw.result && gw.result.txnStatus) || gw.txnStatus || '').toUpperCase();
+  return st === 'COMPLETED' || st === 'SUCCESS' || txn === 'COMPLETED' || txn === 'SUCCESS';
+}
+function xtraFailed(gw) {
+  const st = String(gw.status || '').toUpperCase();
+  const txn = String((gw.result && gw.result.txnStatus) || gw.txnStatus || '').toUpperCase();
+  return st === 'FAILED' || st === 'ERROR' || txn === 'FAILED' || txn === 'ERROR';
+}
+
+app.post('/api/payments/upi/create', requireAuth, rateLimit, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Auth service is not connected to a database yet.' });
+  if (!xtraEnabled()) return res.status(503).json({ error: 'UPI payment is not enabled on this store yet.' });
+  const orderId = Number(req.body.order_id);
+  if (!Number.isInteger(orderId)) return res.status(400).json({ error: 'Invalid order.' });
+  try {
+    const { rows } = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
+    if (rows.length === 0 || (rows[0].user_id !== req.user.id && !isAdmin(req))) return res.status(404).json({ error: 'Order not found.' });
+    const order = rows[0];
+    if (order.status !== 'pending' || order.payment_method !== 'upi') {
+      return res.status(400).json({ error: 'Only pending UPI orders can be paid online.' });
+    }
+    if (order.price <= 0) return res.status(400).json({ error: 'UPI payment needs an amount above \u20B90.' });
+    let mobile = String(req.body.customer_mobile || order.customer_mobile || '').replace(/\D/g, '');
+    if (mobile.length === 12 && mobile.startsWith('91')) mobile = mobile.slice(2);
+    if (!/^\d{10}$/.test(mobile)) return res.status(400).json({ error: 'Enter a valid 10-digit mobile number.' });
+    if (mobile !== order.customer_mobile) {
+      await pool.query('UPDATE orders SET customer_mobile = $1 WHERE id = $2', [mobile, orderId]);
+    }
+    // Reuse a live gateway order; a FAILED one gets a fresh gateway order.
+    if (order.xtra_order_id && order.xtra_payment_url && order.xtra_status !== 'FAILED') {
+      return res.json({ payment_url: order.xtra_payment_url, order_id: orderId, reused: true });
+    }
+    const gwOrderId = 'CP2' + orderId + Date.now().toString().slice(-8);
+    const gw = await xtraPost('/api/create-order', {
+      customer_mobile: mobile,
+      amount: String(order.price),
+      order_id: gwOrderId,
+      redirect_url: 'https://www.avardoofficial.in/?payment_return=' + orderId,
+      remark1: 'Avardo Official order CP2-' + orderId,
+      remark2: req.user.email || '',
+    });
+    if (gw.status !== true || !gw.result || !gw.result.payment_url) {
+      const msg = String((gw && gw.message) || 'Payment gateway did not create the order.').slice(0, 200);
+      return res.status(502).json({ error: msg });
+    }
+    await pool.query('UPDATE orders SET xtra_order_id = $1, xtra_payment_url = $2, xtra_status = $3, updated_at = NOW() WHERE id = $4',
+      [String(gw.result.orderId || gwOrderId), String(gw.result.payment_url), 'created', orderId]);
+    res.json({ payment_url: String(gw.result.payment_url), order_id: orderId });
+  } catch (err) {
+    console.error('upi create failed:', err);
+    res.status(500).json({ error: 'Could not start UPI payment.' });
+  }
+});
+
+app.get('/api/payments/upi/status', requireAuth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Auth service is not connected to a database yet.' });
+  if (!xtraEnabled()) return res.status(503).json({ error: 'UPI payment is not enabled on this store yet.' });
+  const orderId = Number(req.query.order_id);
+  if (!Number.isInteger(orderId)) return res.status(400).json({ error: 'Invalid order.' });
+  try {
+    const { rows } = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
+    if (rows.length === 0 || (rows[0].user_id !== req.user.id && !isAdmin(req))) return res.status(404).json({ error: 'Order not found.' });
+    const order = rows[0];
+    if (order.status === 'paid' || order.status === 'delivered') {
+      return res.json({ order_id: orderId, status: order.status, gateway: order.xtra_status || null, utr: order.xtra_utr || null });
+    }
+    if (!order.xtra_order_id) {
+      return res.json({ order_id: orderId, status: order.status, gateway: null });
+    }
+    const gw = await xtraPost('/api/check-order-status', { order_id: order.xtra_order_id });
+    if (xtraCompleted(gw)) {
+      const utr = (gw.result && gw.result.utr) || gw.utr || null;
+      await pool.query("UPDATE orders SET status = 'paid', xtra_status = 'COMPLETED', xtra_utr = $1, updated_at = NOW() WHERE id = $2", [utr || '', orderId]);
+      fulfilBusanOrder(orderId).catch((e) => console.error('busan fulfil failed:', e.message));
+      return res.json({ order_id: orderId, status: 'paid', gateway: 'COMPLETED', utr });
+    }
+    const failed = xtraFailed(gw);
+    await pool.query('UPDATE orders SET xtra_status = $1, updated_at = NOW() WHERE id = $2', [failed ? 'FAILED' : 'PENDING', orderId]);
+    res.json({
+      order_id: orderId, status: order.status, gateway: failed ? 'FAILED' : 'PENDING',
+      message: typeof gw.message === 'string' ? gw.message.slice(0, 200) : null,
+    });
+  } catch (err) {
+    console.error('upi status failed:', err);
+    res.status(500).json({ error: 'Could not check payment status.' });
   }
 });
 
