@@ -647,7 +647,7 @@ app.post('/api/region-check', rateLimit, async (req, res) => {
         if (!validated.some((x) => x.route === probe.route)) {
           validated.push({ route: probe.route, game: probe.game });
         }
-        if (!username && vd.username) username = String(vd.username);
+        if (!username && vd.username && String(vd.username) !== playerId) username = String(vd.username);
       }
     } catch (err) {
       // A 400 "Invalid player ID or server ID" means this route does not
