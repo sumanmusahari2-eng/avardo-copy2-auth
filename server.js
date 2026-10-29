@@ -608,6 +608,74 @@ app.get('/api/payments/upi/status', requireAuth, async (req, res) => {
   }
 });
 
+// ---- Region checker ----
+// POST /api/region-check {player_id, zone_id} validates the ID against one
+// small product from each MLBB regional route and reports which routes
+// validate it. Validation never spends money (only orders do). A specific
+// regional match wins over the generic route; the generic route alone maps
+// to the store's MLBB India game (proven 2026-10-29: generic validates an
+// India account while Global/Indonesia families reject it). No numeric
+// Zone ID -> region table is used or claimed anywhere.
+const REGION_PROBES = [
+  { route: 'Philippines', game: 'Mobile Legends — Philippines', productId: 'mobile-legends-philippines888_5-diamonds363' },
+  { route: 'Philippines', game: 'Mobile Legends — Philippines', productId: 'mlbbph643_mlbbph11928' },
+  { route: 'Global', game: 'Mobile Legends — Global', productId: 'mlbbglobal202_mlbbglobal5186' },
+  { route: 'Brazil', game: 'Mobile Legends — Brazil', productId: 'mlbbbr178_mlbbbr55992' },
+  { route: 'Russia', game: 'Mobile Legends — Russia', productId: 'mlbb-russia46_mlbbru35714' },
+  { route: 'Turkey', game: 'Mobile Legends — Turkey', productId: 'mlbbtr112_mlbbtr16786' },
+  { route: 'United States', game: 'Mobile Legends — United States', productId: 'mobile-legends-united-states41_mlbbus55672' },
+  { route: 'SG / MY', game: 'Mobile Legends — SG / MY (All Region)', productId: 'sgmy-mlbb893_mlbbspecial14557' },
+  { route: 'SG / MY', game: 'Mobile Legends — SG / MY (All Region)', productId: 'mlbbsgmy885_mlbbsgmy14755' },
+  { route: 'Indonesia', game: null, productId: 'mlbbid35_mlbbid5500' },
+  { route: 'Generic', game: 'Mobile Legends — India', productId: 'mobile-legends114_86990' },
+];
+app.post('/api/region-check', rateLimit, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Auth service is not connected to a database yet.' });
+  const playerId = cleanStr(req.body.player_id, 100);
+  const zoneId = cleanStr(req.body.zone_id, 100);
+  if (!playerId || !zoneId) return res.status(400).json({ error: 'Enter your User ID and Zone ID.' });
+  if (!/^\d+$/.test(playerId) || !/^\d+$/.test(zoneId)) return res.status(400).json({ error: 'User ID and Zone ID must be numbers.' });
+  if (!busan.configured()) return res.json({ configured: false });
+  const validated = [];
+  let username = '';
+  let upstreamFailed = false;
+  for (const probe of REGION_PROBES) {
+    try {
+      const v = await busan.validatePlayer(probe.productId, playerId, zoneId);
+      const vd = (v && v.data) || {};
+      if (vd.valid === true || vd.valid !== false) {
+        if (!validated.some((x) => x.route === probe.route)) {
+          validated.push({ route: probe.route, game: probe.game });
+        }
+        if (!username && vd.username) username = String(vd.username);
+      }
+    } catch (err) {
+      // A 400 "Invalid player ID or server ID" means this route does not
+      // serve the account — that is a NO for this route, not an error.
+      const msg = String(err.message || '');
+      if (!/Invalid player ID or server ID/i.test(msg)) upstreamFailed = true;
+    }
+  }
+  if (validated.length === 0 && upstreamFailed) {
+    return res.status(502).json({ error: 'Region check is unavailable right now. Try again later.' });
+  }
+  const specific = validated.filter((x) => x.route !== 'Generic' && x.route !== 'Indonesia');
+  let recommended = null;
+  let note = '';
+  if (specific.length > 0) {
+    recommended = specific[0].game;
+    if (specific.length > 1) note = 'More than one route validated this ID — pick the country where the account was created.';
+  } else if (validated.some((x) => x.route === 'Generic')) {
+    recommended = 'Mobile Legends — India';
+    note = 'Only the generic route validated this ID. On this store that route is used for MLBB India.';
+  } else if (validated.some((x) => x.route === 'Indonesia')) {
+    note = 'This ID validated on the Indonesia route, which has no matching game on this store yet.';
+  } else {
+    note = 'No route validated this ID. Double-check your User ID and Zone ID.';
+  }
+  res.json({ username, validated: validated.map((x) => x.route), recommended, note });
+});
+
 app.get('/api/orders/me', requireAuth, async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Auth service is not connected to a database yet.' });
   try {
