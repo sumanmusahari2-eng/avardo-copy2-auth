@@ -643,7 +643,7 @@ app.post('/api/region-check', rateLimit, async (req, res) => {
     try {
       const v = await busan.validatePlayer(probe.productId, playerId, zoneId);
       const vd = (v && v.data) || {};
-      if (vd.valid === true || vd.valid !== false) {
+      if (vd.valid === true) {
         if (!validated.some((x) => x.route === probe.route)) {
           validated.push({ route: probe.route, game: probe.game });
         }
