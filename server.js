@@ -152,7 +152,7 @@ function validEmail(email) {
 }
 
 function publicUser(row) {
-  return { id: row.id, email: row.email, name: row.name, created_at: row.created_at, is_reseller: !!row.is_reseller };
+  return { id: row.id, email: row.email, name: row.name, created_at: row.created_at, is_reseller: !!row.is_reseller, is_admin: ADMIN_EMAILS.includes((row.email || '').toLowerCase()) };
 }
 
 function signToken(user) {
@@ -247,8 +247,8 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
 // ---- Store data (admin together with the store login) ----
 // The storefront loads its live catalogue/settings from here when present
 // and falls back to its built-in data otherwise. Only the store admin
-// (Sumanmusahari@gmail.com, signed in) may save.
-const ADMIN_EMAIL = 'sumanmusahari@gmail.com';
+// (an admin email, signed in) may save.
+const ADMIN_EMAILS = ['sumanmusahari@gmail.com', 'avardoofficialstore@gmail.com'];
 
 app.get('/api/store', async (req, res) => {
   if (!pool) return res.json({ configured: false });
@@ -265,7 +265,7 @@ app.get('/api/store', async (req, res) => {
     if (token && JWT_SECRET) {
       try {
         const decoded = jwt.verify(token, JWT_SECRET);
-        if (decoded.email === ADMIN_EMAIL) {
+        if (ADMIN_EMAILS.includes(decoded.email)) {
           privileged = true;
         } else {
           const u = await pool.query('SELECT is_reseller FROM users WHERE id = $1', [decoded.id]);
@@ -293,7 +293,7 @@ app.get('/api/store', async (req, res) => {
 
 app.put('/api/admin/store', requireAuth, rateLimit, async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Auth service is not connected to a database yet.' });
-  if (!req.user || req.user.email !== ADMIN_EMAIL) {
+  if (!req.user || !ADMIN_EMAILS.includes(req.user.email)) {
     return res.status(403).json({ error: 'Admin access only.' });
   }
   const data = req.body;
@@ -316,10 +316,10 @@ app.put('/api/admin/store', requireAuth, rateLimit, async (req, res) => {
 // ---- Phase 1: orders, wallet, top-up requests ----
 // Coins: 1 coin = ₹1. Wallet payments deduct immediately and the order
 // becomes paid (awaiting delivery); WhatsApp orders stay pending until the
-// admin confirms payment. Only the admin (ADMIN_EMAIL) may change order
+// admin confirms payment. Only an admin may change order
 // status or approve top-ups; cancelling a paid wallet order refunds it.
 function isAdmin(req) {
-  return !!(req.user && req.user.email === ADMIN_EMAIL);
+  return !!(req.user && ADMIN_EMAILS.includes(req.user.email));
 }
 
 function cleanStr(v, max) {
