@@ -248,7 +248,7 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
 // The storefront loads its live catalogue/settings from here when present
 // and falls back to its built-in data otherwise. Only the store admin
 // (an admin email, signed in) may save.
-const ADMIN_EMAILS = ['sumanmusahari@gmail.com', 'avardoofficialstore@gmail.com'];
+const ADMIN_EMAILS = ['sumanmusahari@gmail.com', 'avardoofficialstore@gmail.com', 'sumanmusahari2@gmail.com'];
 
 app.get('/api/store', async (req, res) => {
   if (!pool) return res.json({ configured: false });
