@@ -15,7 +15,7 @@ const { Pool } = require('pg');
 const busan = require('./busan');
 
 const app = express();
-app.use(express.json({ limit: '512kb' }));
+app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || '';
