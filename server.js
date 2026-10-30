@@ -312,6 +312,41 @@ app.put('/api/admin/store', requireAuth, rateLimit, async (req, res) => {
     res.status(500).json({ error: 'Could not save store data.' });
   }
 });
+// Partial admin save: one tab sends only its own slice (e.g. just games)
+// instead of the whole multi-MB store snapshot, so a price edit no longer
+// re-uploads megabytes of banner artwork on every save. Whitelisted keys
+// merge into the saved store; everything else is left untouched.
+app.put('/api/admin/partial', requireAuth, rateLimit, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Auth service is not connected to a database yet.' });
+  if (!req.user || !ADMIN_EMAILS.includes(req.user.email)) {
+    return res.status(403).json({ error: 'Admin access only.' });
+  }
+  const patch = req.body;
+  const KEYS = ['games', 'banners', 'faqs', 'highlights', 'logo', 'favicon', 'waNumber', 'theme', 'supportNote', 'resellerTitle', 'resellerText', 'seo', 'moveBannerText', 'bannerSlideSecs', 'categories'];
+  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
+    return res.status(400).json({ error: 'Invalid store data.' });
+  }
+  const updates = {};
+  for (const k of KEYS) if (patch[k] !== undefined) updates[k] = patch[k];
+  if (!Object.keys(updates).length) {
+    return res.status(400).json({ error: 'Nothing to save.' });
+  }
+  try {
+    const { rows } = await pool.query('SELECT data FROM store_data WHERE id = 1');
+    const data = rows.length ? (rows[0].data || {}) : {};
+    Object.assign(data, updates);
+    await pool.query(
+      `INSERT INTO store_data (id, data, updated_at) VALUES (1, $1::jsonb, NOW())
+       ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
+      [JSON.stringify(data)]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('partial store save failed:', err);
+    res.status(500).json({ error: 'Could not save store data.' });
+  }
+});
+
 
 // ---- Phase 1: orders, wallet, top-up requests ----
 // Coins: 1 coin = ₹1. Wallet payments deduct immediately and the order
